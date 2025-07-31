@@ -65,6 +65,12 @@ def get_arguments():
 '''
 update_cache(...)为缓存更新函数，
 将某个类别 pred 对应的新样本（包含其特征与损失信息）加入缓存中，并按照容量上限进行替换策略管理
+
+cache (dict):                   # 缓存字典，每个 key 是类别，每个 value 是一个列表，包含 (feature, loss[, prob_map])。
+pred (int):                     # 当前样本预测类别。
+features_loss (tuple):          # 新样本的特征与损失（可能包含 prob_map），如 (feature, loss) 或 (feature, loss, prob_map)。
+shot_capacity (int):            # 每个类别缓存的最大容量。
+include_prob_map (bool):        # 是否包含 prob_map 信息。
 '''
 
 
@@ -74,18 +80,40 @@ def update_cache(cache,
                  shot_capacity,
                  include_prob_map=False):
     """Update cache with new features and loss, maintaining the maximum shot capacity."""
+    # 表示这个过程是非训练性的
     with torch.no_grad():
+        # 如果 include_prob_map=True，说明 features_loss 中包含 [feature, loss, prob_map]，否则就直接拿全部内容作为缓存元素
+        # prob_map.shape == [1, C], feature.shape == [1, D]
         item = features_loss if not include_prob_map else features_loss[:2] + [
             features_loss[2]
         ]
+        # 类别 pred 已存在缓存中，尝试加入新样本
         if pred in cache:
+            # 如果缓存中该类样本数量小于设定的上限
             if len(cache[pred]) < shot_capacity:
+                #  将当前样本（item）添加进缓存字典 cache 中，属于某个类别 pred 的样本列表
                 cache[pred].append(item)
+            # 如果样本数量已达上限，则判断该样本的熵是否小于缓存中最后一个样本的熵
             elif features_loss[1] < cache[pred][-1][1]:
+                # 若该样本熵低，则替换缓存中最后一个样本
                 cache[pred][-1] = item
+            # 按照熵进行排序，最后一个熵最大
             cache[pred] = sorted(cache[pred], key=operator.itemgetter(1))
         else:
+            # # 第一次遇到该类别，初始化其缓存列表
             cache[pred] = [item]
+
+
+''' 
+compute_cache_logits(...) 是典型的基于缓存（cache）的 logit 计算模块
+
+image_features：                                        # Tensor [1, D]：当前待分类图像的特征（经过 CLIP 编码）
+cache：dict：                                           # 缓存数据结构 {class_id: List[(feat, prob, entropy)]}
+alpha：float：                                          # 权重系数，控制 cache logits 对最终 logits 的影响程度
+beta：float：                                           # 缩放系数，控制特征相似度放大（用于 softmax sharpness）
+clip_weights：                                          # Tensor [C, D]	：所有类别的 prompt 特征，用于对齐维度（有时用于 fallback）
+neg_mask_thresholds：Tuple[float, float] or None：      # 仅在负缓存启用时，表示用于掩蔽筛选缓存样本的概率/熵范围
+'''
 
 
 def compute_cache_logits(image_features,
@@ -96,7 +124,9 @@ def compute_cache_logits(image_features,
                          neg_mask_thresholds=None):
     """Compute logits using positive/negative cache."""
     with torch.no_grad():
+        # 所有缓存特征图
         cache_keys = []
+        # 将 feature 添加到特征图列表
         cache_values = []
         for class_index in sorted(cache.keys()):
             for item in cache[class_index]:
